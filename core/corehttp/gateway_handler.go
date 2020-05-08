@@ -14,17 +14,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dustin/go-humanize"
+	humanize "github.com/dustin/go-humanize"
+	"github.com/gabriel-vasile/mimetype"
 	"github.com/ipfs/go-cid"
 	files "github.com/ipfs/go-ipfs-files"
 	dag "github.com/ipfs/go-merkledag"
-	"github.com/ipfs/go-mfs"
-	"github.com/ipfs/go-path"
+	mfs "github.com/ipfs/go-mfs"
+	path "github.com/ipfs/go-path"
 	"github.com/ipfs/go-path/resolver"
 	coreiface "github.com/ipfs/interface-go-ipfs-core"
 	ipath "github.com/ipfs/interface-go-ipfs-core/path"
 	routing "github.com/libp2p/go-libp2p-core/routing"
-	"github.com/multiformats/go-multibase"
 )
 
 const (
@@ -37,6 +37,25 @@ const (
 type gatewayHandler struct {
 	config GatewayConfig
 	api    coreiface.CoreAPI
+}
+
+// StatusResponseWriter enables us to override HTTP Status Code passed to
+// WriteHeader function inside of http.ServeContent.  Decision is based on
+// presence of HTTP Headers such as Location.
+type statusResponseWriter struct {
+	http.ResponseWriter
+}
+
+func (sw *statusResponseWriter) WriteHeader(code int) {
+	// Check if we need to adjust Status Code to account for scheduled redirect
+	// This enables us to return payload along with HTTP 301
+	// for subdomain redirect in web browsers while also returning body for cli
+	// tools which do not follow redirects by default (curl, wget).
+	redirect := sw.ResponseWriter.Header().Get("Location")
+	if redirect != "" && code == http.StatusOK {
+		code = http.StatusMovedPermanently
+	}
+	sw.ResponseWriter.WriteHeader(code)
 }
 
 func newGatewayHandler(c GatewayConfig, api coreiface.CoreAPI) *gatewayHandler {
@@ -109,6 +128,9 @@ func (i *gatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !i.config.Writable {
 		status = http.StatusMethodNotAllowed
 		errmsg = errmsg + "read only access"
+		w.Header().Add("Allow", http.MethodGet)
+		w.Header().Add("Allow", http.MethodHead)
+		w.Header().Add("Allow", http.MethodOptions)
 	} else {
 		status = http.StatusBadRequest
 		errmsg = errmsg + "bad request for " + r.URL.Path
@@ -143,17 +165,17 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// IPNSHostnameOption might have constructed an IPNS path using the Host header.
+	// HostnameOption might have constructed an IPNS/IPFS path using the Host header.
 	// In this case, we need the original path for constructing redirects
 	// and links that match the requested URL.
 	// For example, http://example.net would become /ipns/example.net, and
 	// the redirects and links would end up as http://example.net/ipns/example.net
-	originalUrlPath := prefix + urlPath
-	ipnsHostname := false
-	if hdr := r.Header.Get("X-Ipns-Original-Path"); len(hdr) > 0 {
-		originalUrlPath = prefix + hdr
-		ipnsHostname = true
+	requestURI, err := url.ParseRequestURI(r.RequestURI)
+	if err != nil {
+		webError(w, "failed to parse request path", err, http.StatusInternalServerError)
+		return
 	}
+	originalUrlPath := prefix + requestURI.Path
 
 	// Service Worker registration request
 	if r.Header.Get("Service-Worker") == "script" {
@@ -206,41 +228,8 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 	w.Header().Set("X-IPFS-Path", urlPath)
 	w.Header().Set("Etag", etag)
 
-	// Suborigin header, sandboxes apps from each other in the browser (even
-	// though they are served from the same gateway domain).
-	//
-	// Omitted if the path was treated by IPNSHostnameOption(), for example
-	// a request for http://example.net/ would be changed to /ipns/example.net/,
-	// which would turn into an incorrect Suborigin header.
-	// In this case the correct thing to do is omit the header because it is already
-	// handled correctly without a Suborigin.
-	//
-	// NOTE: This is not yet widely supported by browsers.
-	if !ipnsHostname {
-		// e.g.: 1="ipfs", 2="QmYuNaKwY...", ...
-		pathComponents := strings.SplitN(urlPath, "/", 4)
-
-		var suboriginRaw []byte
-		cidDecoded, err := cid.Decode(pathComponents[2])
-		if err != nil {
-			// component 2 doesn't decode with cid, so it must be a hostname
-			suboriginRaw = []byte(strings.ToLower(pathComponents[2]))
-		} else {
-			suboriginRaw = cidDecoded.Bytes()
-		}
-
-		base32Encoded, err := multibase.Encode(multibase.Base32, suboriginRaw)
-		if err != nil {
-			internalWebError(w, err)
-			return
-		}
-
-		suborigin := pathComponents[1] + "000" + strings.ToLower(base32Encoded)
-		w.Header().Set("Suborigin", suborigin)
-	}
-
 	// set these headers _after_ the error, for we may just not have it
-	// and dont want the client to cache a 500 response...
+	// and don't want the client to cache a 500 response...
 	// and only if it's /ipfs!
 	// TODO: break this out when we split /ipfs /ipns routes.
 	modtime := time.Now()
@@ -322,10 +311,10 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 
 	// construct the correct back link
 	// https://github.com/ipfs/go-ipfs/issues/1365
-	var backLink string = prefix + urlPath
+	var backLink string = originalUrlPath
 
 	// don't go further up than /ipfs/$hash/
-	pathSplit := path.SplitList(backLink)
+	pathSplit := path.SplitList(urlPath)
 	switch {
 	// keep backlink
 	case len(pathSplit) == 3: // url: /ipfs/$hash
@@ -333,7 +322,7 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 	// keep backlink
 	case len(pathSplit) == 4 && pathSplit[3] == "": // url: /ipfs/$hash/
 
-	// add the correct link depending on wether the path ends with a slash
+	// add the correct link depending on whether the path ends with a slash
 	default:
 		if strings.HasSuffix(backLink, "/") {
 			backLink += "./.."
@@ -342,28 +331,25 @@ func (i *gatewayHandler) getOrHeadHandler(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	// strip /ipfs/$hash from backlink if IPNSHostnameOption touched the path.
-	if ipnsHostname {
-		backLink = prefix + "/"
-		if len(pathSplit) > 5 {
-			// also strip the trailing segment, because it's a backlink
-			backLinkParts := pathSplit[3 : len(pathSplit)-2]
-			backLink += path.Join(backLinkParts) + "/"
-		}
-	}
-
-	var hash string
-	if !strings.HasPrefix(originalUrlPath, ipfsPathPrefix) {
-		hash = resolvedPath.Cid().String()
-	}
+	hash := resolvedPath.Cid().String()
 
 	// See comment above where originalUrlPath is declared.
 	tplData := listingTemplateData{
 		Listing:  dirListing,
-		Path:     originalUrlPath,
+		Path:     urlPath,
 		BackLink: backLink,
 		Hash:     hash,
 	}
+
+	// See statusResponseWriter.WriteHeader
+	// and https://github.com/ipfs/go-ipfs/issues/7164
+	// Note: this needs to occur before listingTemplate.Execute otherwise we get
+	// superfluous response.WriteHeader call from prometheus/client_golang
+	if w.Header().Get("Location") != "" {
+		w.WriteHeader(http.StatusMovedPermanently)
+		return
+	}
+
 	err = listingTemplate.Execute(w, tplData)
 	if err != nil {
 		internalWebError(w, err)
@@ -391,10 +377,16 @@ func (i *gatewayHandler) serveFile(w http.ResponseWriter, req *http.Request, nam
 	} else {
 		ctype = mime.TypeByExtension(gopath.Ext(name))
 		if ctype == "" {
-			buf := make([]byte, 512)
-			n, _ := io.ReadFull(content, buf[:])
-			ctype = http.DetectContentType(buf[:n])
-			_, err := content.Seek(0, io.SeekStart)
+			// uses https://github.com/gabriel-vasile/mimetype library to determine the content type.
+			// Fixes https://github.com/ipfs/go-ipfs/issues/7252
+			mimeType, err := mimetype.DetectReader(content)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("cannot detect content-type: %s", err.Error()), http.StatusInternalServerError)
+				return
+			}
+
+			ctype = mimeType.String()
+			_, err = content.Seek(0, io.SeekStart)
 			if err != nil {
 				http.Error(w, "seeker can't seek", http.StatusInternalServerError)
 				return
@@ -410,6 +402,7 @@ func (i *gatewayHandler) serveFile(w http.ResponseWriter, req *http.Request, nam
 	}
 	w.Header().Set("Content-Type", ctype)
 
+	w = &statusResponseWriter{w}
 	http.ServeContent(w, req, name, modtime, content)
 }
 
